@@ -7,6 +7,7 @@ use crate::transport::{
     connection,
     connection::{Connection, ConnectionConfig, ErrorReceiver, VerifiedKeyspaceName},
 };
+use crate::util;
 
 #[cfg(feature = "cloud")]
 use super::node::resolve_hostname;
@@ -17,7 +18,9 @@ use super::topology::{PeerEndpoint, UntranslatedEndpoint};
 use super::NodeAddr;
 
 use arc_swap::ArcSwap;
-use futures::{future::RemoteHandle, stream::FuturesUnordered, Future, FutureExt, StreamExt};
+use event_listener::Event;
+use futures::{future::RemoteHandle, stream::FuturesUnordered, Future, FutureExt};
+use futures_util::StreamExt;
 use rand::Rng;
 use std::convert::TryInto;
 use std::io::ErrorKind;
@@ -25,9 +28,8 @@ use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
-
-use tokio::sync::{broadcast, mpsc, Notify};
 use tracing::instrument::WithSubscriber;
+
 use tracing::{debug, trace, warn};
 
 /// The target size of a per-node connection pool.
@@ -151,9 +153,9 @@ impl std::fmt::Debug for PoolConnections {
 #[derive(Clone)]
 pub(crate) struct NodeConnectionPool {
     conns: Arc<ArcSwap<MaybePoolConnections>>,
-    use_keyspace_request_sender: mpsc::Sender<UseKeyspaceRequest>,
+    use_keyspace_request_sender: flume::Sender<UseKeyspaceRequest>,
     _refiller_handle: Arc<RemoteHandle<()>>,
-    pool_updated_notify: Arc<Notify>,
+    pool_updated_notify: Arc<Event>,
     endpoint: Arc<RwLock<UntranslatedEndpoint>>,
 }
 
@@ -170,10 +172,10 @@ impl NodeConnectionPool {
         endpoint: UntranslatedEndpoint,
         #[allow(unused_mut)] mut pool_config: PoolConfig, // `mut` needed only with "cloud" feature
         current_keyspace: Option<VerifiedKeyspaceName>,
-        pool_empty_notifier: broadcast::Sender<()>,
+        pool_empty_notifier: async_broadcast::Sender<()>,
     ) -> Self {
-        let (use_keyspace_request_sender, use_keyspace_request_receiver) = mpsc::channel(1);
-        let pool_updated_notify = Arc::new(Notify::new());
+        let (use_keyspace_request_sender, use_keyspace_request_receiver) = flume::bounded(1);
+        let pool_updated_notify = Arc::new(Event::new());
 
         #[cfg(feature = "cloud")]
         if pool_config.connection_config.cloud_config.is_some() {
@@ -212,7 +214,10 @@ impl NodeConnectionPool {
 
         let conns = refiller.get_shared_connections();
         let (fut, refiller_handle) = refiller.run(use_keyspace_request_receiver).remote_handle();
+        #[cfg(feature = "tokio_runtime")]
         tokio::spawn(fut.with_current_subscriber());
+        #[cfg(feature = "glommio_runtime")]
+        glommio::spawn_local(fut.with_current_subscriber());
 
         Self {
             conns,
@@ -311,10 +316,10 @@ impl NodeConnectionPool {
         &self,
         keyspace_name: VerifiedKeyspaceName,
     ) -> Result<(), QueryError> {
-        let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+        let (response_sender, response_receiver) = flume::bounded(1);
 
         self.use_keyspace_request_sender
-            .send(UseKeyspaceRequest {
+            .send_async(UseKeyspaceRequest {
                 keyspace_name,
                 response_sender,
             })
@@ -322,7 +327,7 @@ impl NodeConnectionPool {
             .expect("Bug in ConnectionKeeper::use_keyspace sending");
         // Other end of this channel is in the Refiller, can't be dropped while we have &self to _refiller_handle
 
-        response_receiver.await.unwrap() // NodePoolRefiller always responds
+        response_receiver.recv_async().await.unwrap() // NodePoolRefiller always responds
     }
 
     // Waits until the pool becomes initialized.
@@ -331,7 +336,7 @@ impl NodeConnectionPool {
     pub(crate) async fn wait_until_initialized(&self) {
         // First, register for the notification
         // so that we don't miss it
-        let notified = self.pool_updated_notify.notified();
+        let notified = self.pool_updated_notify.listen();
 
         if let MaybePoolConnections::Initializing = **self.conns.load() {
             // If the pool is not initialized yet, wait until we get a notification
@@ -474,16 +479,16 @@ struct PoolRefiller {
     current_keyspace: Option<VerifiedKeyspaceName>,
 
     // Signaled when the connection pool is updated
-    pool_updated_notify: Arc<Notify>,
+    pool_updated_notify: Arc<Event>,
 
     // Signaled when the connection pool becomes empty
-    pool_empty_notifier: broadcast::Sender<()>,
+    pool_empty_notifier: async_broadcast::Sender<()>,
 }
 
 #[derive(Debug)]
 struct UseKeyspaceRequest {
     keyspace_name: VerifiedKeyspaceName,
-    response_sender: tokio::sync::oneshot::Sender<Result<(), QueryError>>,
+    response_sender: flume::Sender<Result<(), QueryError>>,
 }
 
 impl PoolRefiller {
@@ -491,8 +496,8 @@ impl PoolRefiller {
         endpoint: Arc<RwLock<UntranslatedEndpoint>>,
         pool_config: PoolConfig,
         current_keyspace: Option<VerifiedKeyspaceName>,
-        pool_updated_notify: Arc<Notify>,
-        pool_empty_notifier: broadcast::Sender<()>,
+        pool_updated_notify: Arc<Event>,
+        pool_empty_notifier: async_broadcast::Sender<()>,
     ) -> Self {
         // At the beginning, we assume the node does not have any shards
         // and assume that the node is a Cassandra node
@@ -535,25 +540,26 @@ impl PoolRefiller {
     // The main loop of the pool refiller
     pub(crate) async fn run(
         mut self,
-        mut use_keyspace_request_receiver: mpsc::Receiver<UseKeyspaceRequest>,
+        use_keyspace_request_receiver: flume::Receiver<UseKeyspaceRequest>,
     ) {
         debug!(
             "[{}] Started asynchronous pool worker",
             self.endpoint_description()
         );
 
-        let mut next_refill_time = tokio::time::Instant::now();
+        let mut next_refill_time = std::time::Instant::now();
         let mut refill_scheduled = true;
 
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep_until(next_refill_time), if refill_scheduled => {
+            futures_util::select! {
+                _ = util::sleep_until(next_refill_time).fuse() => { //, if refill_scheduled => {
                     self.had_error_since_last_refill = false;
                     self.start_filling();
                     refill_scheduled = false;
                 }
 
-                evt = self.ready_connections.select_next_some(), if !self.ready_connections.is_empty() => {
+                // If there is a ready connection select it
+                evt = self.ready_connections.select_next_some().fuse() => { //, if !self.ready_connections.is_empty() => {
                     self.handle_ready_connection(evt);
 
                     if self.is_full() {
@@ -566,15 +572,17 @@ impl PoolRefiller {
                     }
                 }
 
-                evt = self.connection_errors.select_next_some(), if !self.connection_errors.is_empty() => {
+                // If there are errors then process them
+                evt = self.connection_errors.select_next_some().fuse() => {//, if !self.connection_errors.is_empty() => {
                     if let Some(conn) = evt.connection.upgrade() {
                         debug!("[{}] Got error for connection {:p}: {:?}", self.endpoint_description(), Arc::as_ptr(&conn), evt.error);
                         self.remove_connection(conn, evt.error);
                     }
                 }
 
-                req = use_keyspace_request_receiver.recv() => {
-                    if let Some(req) = req {
+                // else if there is a use keyspace request, handle it
+                req = use_keyspace_request_receiver.recv_async().fuse() => {
+                    if let Ok(req) = req {
                         debug!("[{}] Requested keyspace change: {}", self.endpoint_description(), req.keyspace_name.as_str());
                         self.use_keyspace(&req.keyspace_name, req.response_sender);
                     } else {
@@ -604,7 +612,7 @@ impl PoolRefiller {
                     delay.as_millis(),
                 );
 
-                next_refill_time = tokio::time::Instant::now() + delay;
+                next_refill_time = std::time::Instant::now() + delay;
                 refill_scheduled = true;
             }
         }
@@ -1007,7 +1015,7 @@ impl PoolRefiller {
         self.shared_conns.store(new_conns);
 
         // Notify potential waiters
-        self.pool_updated_notify.notify_waiters();
+        self.pool_updated_notify.notify(usize::MAX);
     }
 
     // Removes given connection from the pool. It looks both into active
@@ -1046,7 +1054,7 @@ impl PoolRefiller {
                 self.active_connection_count(),
             );
             if !self.has_connections() {
-                let _ = self.pool_empty_notifier.send(());
+                let _ = self.pool_empty_notifier.broadcast(());
             }
             self.update_shared_conns(Some(last_error));
             return;
@@ -1077,7 +1085,7 @@ impl PoolRefiller {
     fn use_keyspace(
         &mut self,
         keyspace_name: &VerifiedKeyspaceName,
-        response_sender: tokio::sync::oneshot::Sender<Result<(), QueryError>>,
+        response_sender: flume::Sender<Result<(), QueryError>>,
     ) {
         self.current_keyspace = Some(keyspace_name.clone());
 
@@ -1100,7 +1108,7 @@ impl PoolRefiller {
                 return Ok(());
             }
 
-            let use_keyspace_results: Vec<Result<(), QueryError>> = tokio::time::timeout(
+            let use_keyspace_results: Vec<Result<(), QueryError>> = util::timeout(
                 connect_timeout,
                 futures::future::join_all(use_keyspace_futures),
             )
@@ -1134,7 +1142,20 @@ impl PoolRefiller {
             Err(QueryError::IoError(io_error.unwrap()))
         };
 
+        #[cfg(feature = "tokio_runtime")]
         tokio::task::spawn(
+            async move {
+                let res = fut.await;
+                match &res {
+                    Ok(()) => debug!("[{}] Successfully changed current keyspace", address),
+                    Err(err) => warn!("[{}] Failed to change keyspace: {:?}", address, err),
+                }
+                let _ = response_sender.send(res);
+            }
+            .with_current_subscriber(),
+        );
+        #[cfg(feature = "glommio_runtime")]
+        glommio::spawn_local(
             async move {
                 let res = fut.await;
                 match &res {
@@ -1213,7 +1234,7 @@ async fn wait_for_error(
 ) -> BrokenConnectionEvent {
     BrokenConnectionEvent {
         connection,
-        error: error_receiver.await.unwrap_or_else(|_| {
+        error: error_receiver.recv_async().await.unwrap_or_else(|_| {
             QueryError::IoError(Arc::new(std::io::Error::new(
                 ErrorKind::Other,
                 "Connection broken",

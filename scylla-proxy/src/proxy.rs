@@ -5,6 +5,7 @@ use crate::frame::{
 };
 use crate::{RequestOpcode, TargetShard};
 use bytes::Bytes;
+use futures_util::FutureExt;
 use scylla_cql::frame::types::read_string_multimap;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -12,29 +13,28 @@ use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
-use tokio::sync::mpsc::error::TryRecvError;
-use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, trace, warn};
 
 // Used to notify the user that the proxy finished - this happens when all Senders are dropped.
-type FinishWaiter = mpsc::Receiver<()>;
-type FinishGuard = mpsc::Sender<()>;
+type FinishWaiter = flume::Receiver<()>;
+type FinishGuard = flume::Sender<()>;
 
 // Used to tell all the proxy workers to stop when the user requests that with [RunningProxy::finish()].
-type TerminateNotifier = tokio::sync::broadcast::Receiver<()>;
-type TerminateSignaler = tokio::sync::broadcast::Sender<()>;
+type TerminateNotifier = async_broadcast::Receiver<()>;
+type TerminateSignaler = async_broadcast::Sender<()>;
 
 // Used to tell all proxy workers working on same connection to stop when
 // a rule being applied has connection drop set.
-type ConnectionCloseNotifier = tokio::sync::broadcast::Receiver<()>;
-type ConnectionCloseSignaler = tokio::sync::broadcast::Sender<()>;
+type ConnectionCloseNotifier = async_broadcast::Receiver<()>;
+type ConnectionCloseSignaler = async_broadcast::Sender<()>;
 
 // Used to gather errors from all proxy workers and propagate them to the proxy user,
 // returning the first of them from [RunningProxy::finish()].
-type ErrorPropagator = mpsc::UnboundedSender<ProxyError>;
-type ErrorSink = mpsc::UnboundedReceiver<ProxyError>;
+type ErrorPropagator = flume::Sender<ProxyError>;
+type ErrorSink = flume::Receiver<ProxyError>;
 
 static HARDCODED_OPTIONS_PARAMS: FrameParams = FrameParams {
     flags: 0,
@@ -336,10 +336,10 @@ impl Proxy {
     /// Runs the [Proxy], i.e. makes it ready for accepting drivers' connections.
     /// Returns a [RunningProxy] handle that can be used to stop the proxy or change the rules.
     pub async fn run(self) -> Result<RunningProxy, DoorkeeperError> {
-        let (terminate_signaler, _t) = tokio::sync::broadcast::channel(1);
-        let (finish_guard, finish_waiter) = mpsc::channel(1);
+        let (terminate_signaler, _t) = async_broadcast::broadcast(1);
+        let (finish_guard, finish_waiter) = flume::bounded(1);
 
-        let (error_propagator, error_sink) = mpsc::unbounded_channel();
+        let (error_propagator, error_sink) = flume::unbounded();
         let (doorkeepers, running_nodes): (Vec<_>, Vec<RunningNode>) = self
             .nodes
             .into_iter()
@@ -436,8 +436,8 @@ impl RunningProxy {
     pub fn sanity_check(&mut self) -> Result<(), ProxyError> {
         match self.error_sink.try_recv() {
             Ok(err) => Err(err),
-            Err(TryRecvError::Empty) => Ok(()),
-            Err(TryRecvError::Disconnected) => {
+            Err(flume::TryRecvError::Empty) => Ok(()),
+            Err(flume::TryRecvError::Disconnected) => {
                 // As we haven't awaited finish of all workers yet, there must be a faulty case without proper error handling.
                 Err(ProxyError::SanityCheckFailure)
             }
@@ -446,13 +446,13 @@ impl RunningProxy {
 
     /// Waits until an error occurs in proxy. If proxy finishes with no errors occurred, returns Err(()).
     pub async fn wait_for_error(&mut self) -> Option<ProxyError> {
-        self.error_sink.recv().await
+        self.error_sink.recv_async().await.ok()
     }
 
     /// Requests termination of all proxy workers and awaits its completion.
     /// Returns the first error that occurred in proxy.
-    pub async fn finish(mut self) -> Result<(), ProxyError> {
-        self.terminate_signaler.send(()).map_err(|err| {
+    pub async fn finish(self) -> Result<(), ProxyError> {
+        self.terminate_signaler.broadcast(()).await.map_err(|err| {
             ProxyError::AwaitFinishFailure(format!(
                 "Send error in terminate_signaler: {} (bug!)",
                 err
@@ -463,15 +463,15 @@ impl RunningProxy {
         // This to make sure that also workers not-yet-spawned when terminate signal was sent will terminate.
         std::mem::drop(self.terminate_signaler);
 
-        if self.finish_waiter.recv().await.is_some() {
+        if self.finish_waiter.recv_async().await.is_ok() {
             unreachable!();
         };
         info!("All workers have finished.");
 
         match self.error_sink.try_recv() {
             Ok(err) => Err(err),
-            Err(TryRecvError::Disconnected) => Ok(()),
-            Err(TryRecvError::Empty) => {
+            Err(flume::TryRecvError::Disconnected) => Ok(()),
+            Err(flume::TryRecvError::Empty) => {
                 // As we have already awaited finish of all workers, there must be a logic bug.
                 unreachable!("Worker await logic bug!");
             }
@@ -540,12 +540,12 @@ impl Doorkeeper {
 
     async fn run(mut self) {
         self.update_shards_count().await;
-        let mut own_terminate_notifier = self.terminate_signaler.subscribe();
-        let (connection_close_tx, _connection_close_rx) = broadcast::channel::<()>(2);
+        let mut own_terminate_notifier = self.terminate_signaler.new_receiver();
+        let (connection_close_tx, _connection_close_rx) = async_broadcast::broadcast::<()>(2);
         let mut connection_no: usize = 0;
         loop {
-            tokio::select! {
-                res = self.accept_connection(&connection_close_tx, connection_no) => {
+            futures_util::select! {
+                res = self.accept_connection(&connection_close_tx, connection_no).fuse() => {
                     match res {
                         Ok(()) => connection_no += 1,
                         Err(err) => {
@@ -560,7 +560,7 @@ impl Doorkeeper {
                         },
                     }
                 },
-                _terminate = own_terminate_notifier.recv() => break
+                _terminate = own_terminate_notifier.recv().fuse() => break
             }
         }
         debug!(
@@ -617,9 +617,9 @@ impl Doorkeeper {
         let (driver_read, driver_write) = driver_stream.into_split();
 
         let new_worker = || ProxyWorker {
-            terminate_notifier: self.terminate_signaler.subscribe(),
+            terminate_notifier: self.terminate_signaler.new_receiver(),
             finish_guard: self.finish_guard.clone(),
-            connection_close_notifier: connection_close_tx.subscribe(),
+            connection_close_notifier: connection_close_tx.new_receiver(),
             error_propagator: self.error_propagator.clone(),
             driver_addr,
             real_addr: self.node.real_addr(),
@@ -627,18 +627,18 @@ impl Doorkeeper {
             shard,
         };
 
-        let (tx_request, rx_request) = mpsc::unbounded_channel::<RequestFrame>();
-        let (tx_response, rx_response) = mpsc::unbounded_channel::<ResponseFrame>();
-        let (tx_cluster, rx_cluster) = mpsc::unbounded_channel::<RequestFrame>();
-        let (tx_driver, rx_driver) = mpsc::unbounded_channel::<ResponseFrame>();
+        let (tx_request, rx_request) = flume::unbounded::<RequestFrame>();
+        let (tx_response, rx_response) = flume::unbounded::<ResponseFrame>();
+        let (tx_cluster, rx_cluster) = flume::unbounded::<RequestFrame>();
+        let (tx_driver, rx_driver) = flume::unbounded::<ResponseFrame>();
         let event_register_flag = Arc::new(AtomicBool::new(false));
 
         tokio::task::spawn(new_worker().receiver_from_driver(driver_read, tx_request));
         tokio::task::spawn(new_worker().sender_to_driver(
             driver_write,
             rx_driver,
-            connection_close_tx.subscribe(),
-            self.terminate_signaler.subscribe(),
+            connection_close_tx.new_receiver(),
+            self.terminate_signaler.new_receiver(),
         ));
         tokio::task::spawn(new_worker().request_processor(
             rx_request,
@@ -657,8 +657,8 @@ impl Doorkeeper {
             tokio::task::spawn(new_worker().sender_to_cluster(
                 cluster_write,
                 rx_cluster,
-                connection_close_tx.subscribe(),
-                self.terminate_signaler.subscribe(),
+                connection_close_tx.new_receiver(),
+                self.terminate_signaler.new_receiver(),
             ));
             tokio::task::spawn(new_worker().receiver_from_cluster(cluster_read, tx_response));
             tokio::task::spawn(new_worker().response_processor(
@@ -873,19 +873,19 @@ impl ProxyWorker {
     async fn run_until_interrupted<F, Fut>(mut self, worker_name: &'static str, f: F)
     where
         F: FnOnce(SocketAddr, SocketAddr, Option<SocketAddr>) -> Fut,
-        Fut: Future<Output = Result<(), ProxyError>>,
+        Fut: Future<Output = Result<(), ProxyError>> + Unpin,
     {
-        let fut = f(self.driver_addr, self.proxy_addr, self.real_addr);
+        let mut fut = f(self.driver_addr, self.proxy_addr, self.real_addr).fuse();
 
-        tokio::select! {
+        futures_util::select! {
             result = fut => {
                 if let Err(err) = result {
                     // error_propagator could be a field
                     let _ = self.error_propagator.send(err);
                 }
             }
-            _ = self.terminate_notifier.recv() => (),
-            _ = self.connection_close_notifier.recv() => (),
+            _ = self.terminate_notifier.recv().fuse() => (),
+            _ = self.connection_close_notifier.recv().fuse() => (),
         }
         self.exit(worker_name);
     }
@@ -893,32 +893,35 @@ impl ProxyWorker {
     async fn receiver_from_driver(
         self,
         mut read_half: (impl AsyncRead + Unpin),
-        request_processor_tx: mpsc::UnboundedSender<RequestFrame>,
+        request_processor_tx: flume::Sender<RequestFrame>,
     ) {
         let shard = self.shard;
         self.run_until_interrupted(
             "receiver_from_driver",
-            |driver_addr, proxy_addr, _real_addr| async move {
-                loop {
-                    let frame = frame::read_request_frame(&mut read_half)
-                        .await
-                        .map_err(|err| {
-                            warn!("Request reception from {} error: {}", driver_addr, err);
-                            WorkerError::DriverDisconnected(driver_addr)
-                        })?;
+            |driver_addr, proxy_addr, _real_addr| {
+                Box::pin(async move {
+                    loop {
+                        let frame =
+                            frame::read_request_frame(&mut read_half)
+                                .await
+                                .map_err(|err| {
+                                    warn!("Request reception from {} error: {}", driver_addr, err);
+                                    WorkerError::DriverDisconnected(driver_addr)
+                                })?;
 
-                    debug!(
-                        "Intercepted Driver ({}) -> Cluster ({}) ({}) frame. opcode: {:?}.",
-                        driver_addr,
-                        proxy_addr,
-                        DisplayableShard(shard),
-                        &frame.opcode
-                    );
-                    if request_processor_tx.send(frame).is_err() {
-                        warn!("request_processor had exited.");
-                        return Result::<(), ProxyError>::Ok(());
+                        debug!(
+                            "Intercepted Driver ({}) -> Cluster ({}) ({}) frame. opcode: {:?}.",
+                            driver_addr,
+                            proxy_addr,
+                            DisplayableShard(shard),
+                            &frame.opcode
+                        );
+                        if request_processor_tx.send(frame).is_err() {
+                            warn!("request_processor had exited.");
+                            return Result::<(), ProxyError>::Ok(());
+                        }
                     }
-                }
+                })
             },
         )
         .await
@@ -927,35 +930,37 @@ impl ProxyWorker {
     async fn receiver_from_cluster(
         self,
         mut read_half: (impl AsyncRead + Unpin),
-        response_processor_tx: mpsc::UnboundedSender<ResponseFrame>,
+        response_processor_tx: flume::Sender<ResponseFrame>,
     ) {
         let shard = self.shard;
         self.run_until_interrupted(
             "receiver_from_cluster",
-            |driver_addr, _proxy_addr, real_addr| async move {
-                let real_addr = real_addr.expect("BUG: no real_addr in cluster worker");
-                loop {
-                    let frame =
-                        frame::read_response_frame(&mut read_half)
-                            .await
-                            .map_err(|err| {
-                                warn!("Response reception from {} error: {}", real_addr, err);
-                                WorkerError::NodeDisconnected(real_addr)
-                            })?;
+            |driver_addr, _proxy_addr, real_addr| {
+                Box::pin(async move {
+                    let real_addr = real_addr.expect("BUG: no real_addr in cluster worker");
+                    loop {
+                        let frame =
+                            frame::read_response_frame(&mut read_half)
+                                .await
+                                .map_err(|err| {
+                                    warn!("Response reception from {} error: {}", real_addr, err);
+                                    WorkerError::NodeDisconnected(real_addr)
+                                })?;
 
-                    debug!(
-                        "Intercepted Cluster ({}) -> Driver ({}) ({}) frame. opcode: {:?}.",
-                        real_addr,
-                        driver_addr,
-                        DisplayableShard(shard),
-                        &frame.opcode
-                    );
+                        debug!(
+                            "Intercepted Cluster ({}) -> Driver ({}) ({}) frame. opcode: {:?}.",
+                            real_addr,
+                            driver_addr,
+                            DisplayableShard(shard),
+                            &frame.opcode
+                        );
 
-                    if response_processor_tx.send(frame).is_err() {
-                        warn!("response_processor had exited.");
-                        return Ok::<(), ProxyError>(());
+                        if response_processor_tx.send(frame).is_err() {
+                            warn!("response_processor had exited.");
+                            return Ok::<(), ProxyError>(());
+                        }
                     }
-                }
+                })
             },
         )
         .await;
@@ -964,18 +969,17 @@ impl ProxyWorker {
     async fn sender_to_driver(
         self,
         mut write_half: (impl AsyncWrite + Unpin),
-        mut responses_rx: mpsc::UnboundedReceiver<ResponseFrame>,
+        responses_rx: flume::Receiver<ResponseFrame>,
         mut connection_close_notifier: ConnectionCloseNotifier,
         mut terminate_notifier: TerminateNotifier,
     ) {
         let shard = self.shard;
-        self.run_until_interrupted(
-            "sender_to_driver",
-            |driver_addr, proxy_addr, _real_addr| async move {
+        self.run_until_interrupted("sender_to_driver", |driver_addr, proxy_addr, _real_addr| {
+            Box::pin(async move {
                 loop {
-                    let response = match responses_rx.recv().await {
-                        Some(response) => response,
-                        None => {
+                    let response = match responses_rx.recv_async().await {
+                        Ok(response) => response,
+                        Err(_e) => {
                             if terminate_notifier.try_recv().is_err()
                                 && connection_close_notifier.try_recv().is_err()
                             {
@@ -1002,27 +1006,26 @@ impl ProxyWorker {
                         return Ok(());
                     }
                 }
-            },
-        )
+            })
+        })
         .await;
     }
 
     async fn sender_to_cluster(
         self,
         mut write_half: (impl AsyncWrite + Unpin),
-        mut requests_rx: mpsc::UnboundedReceiver<RequestFrame>,
+        requests_rx: flume::Receiver<RequestFrame>,
         mut connection_close_notifier: ConnectionCloseNotifier,
         mut terminate_notifier: TerminateNotifier,
     ) {
         let shard = self.shard;
-        self.run_until_interrupted(
-            "sender_to_driver",
-            |_driver_addr, proxy_addr, real_addr| async move {
+        self.run_until_interrupted("sender_to_driver", |_driver_addr, proxy_addr, real_addr| {
+            Box::pin(async move {
                 let real_addr = real_addr.expect("BUG: no real_addr in cluster worker");
                 loop {
-                    let request = match requests_rx.recv().await {
-                        Some(request) => request,
-                        None => {
+                    let request = match requests_rx.recv_async().await {
+                        Ok(request) => request,
+                        Err(_e) => {
                             if terminate_notifier.try_recv().is_err()
                                 && connection_close_notifier.try_recv().is_err()
                             {
@@ -1050,27 +1053,27 @@ impl ProxyWorker {
                         return Ok(());
                     }
                 }
-            },
-        )
+            })
+        })
         .await;
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn request_processor(
         self,
-        mut requests_rx: mpsc::UnboundedReceiver<RequestFrame>,
-        driver_tx: mpsc::UnboundedSender<ResponseFrame>,
-        cluster_tx: mpsc::UnboundedSender<RequestFrame>,
+        requests_rx: flume::Receiver<RequestFrame>,
+        driver_tx: flume::Sender<ResponseFrame>,
+        cluster_tx: flume::Sender<RequestFrame>,
         connection_no: usize,
         request_rules: Arc<Mutex<Vec<RequestRule>>>,
         connection_close_signaler: ConnectionCloseSignaler,
         event_registered_flag: Arc<AtomicBool>,
     ) {
         let shard = self.shard;
-        self.run_until_interrupted("request_processor", |driver_addr, _, real_addr| async move {
+        self.run_until_interrupted("request_processor", |driver_addr, _, real_addr| Box::pin(async move {
             'mainloop: loop {
-                match requests_rx.recv().await {
-                    Some(request) => {
+                match requests_rx.recv_async().await {
+                    Ok(request) => {
                         if request.opcode == RequestOpcode::Register {
                             event_registered_flag.store(true, Ordering::Relaxed);
                         }
@@ -1104,7 +1107,7 @@ impl ProxyWorker {
                                 let pass_action = async move {
                                     if let Some(ref pass_action) = to_addressee_action {
                                         if let Some(time) = pass_action.delay {
-                                            tokio::time::sleep(time).await;
+                                            sleep(time).await;
                                         }
                                         let passed_frame = match pass_action.msg_processor {
                                             Some(ref processor) => processor(request_clone),
@@ -1119,7 +1122,7 @@ impl ProxyWorker {
                                 let forge_action = async move {
                                     if let Some(ref forge_action) = to_sender_action {
                                         if let Some(time) = forge_action.delay {
-                                            tokio::time::sleep(time).await;
+                                            sleep(time).await;
                                         }
                                         let forged_frame = {
                                             let processor = forge_action.msg_processor.as_ref()
@@ -1135,7 +1138,7 @@ impl ProxyWorker {
                                 let drop_action = async move {
                                     if let Some(ref delay) = drop_connection_action {
                                         if let Some(ref time) = delay {
-                                            tokio::time::sleep(*time).await;
+                                            sleep(*time).await;
                                         }
                                         // close connection.
                                         info!(
@@ -1144,7 +1147,7 @@ impl ProxyWorker {
                                             DisplayableRealAddrOption(real_addr),
                                             DisplayableShard(shard),
                                         );
-                                        let _ = connection_close_signaler_clone.send(());
+                                        let _ = connection_close_signaler_clone.broadcast(());
                                     }
                                 };
 
@@ -1157,29 +1160,29 @@ impl ProxyWorker {
                         }
                         let _ = cluster_tx.send(request); // default action
                     }
-                    None => return Ok(()),
+                    Err(_e) => return Ok(()),
                 }
             }
-        })
+        }))
         .await;
     }
 
     #[allow(clippy::too_many_arguments)]
     async fn response_processor(
         self,
-        mut responses_rx: mpsc::UnboundedReceiver<ResponseFrame>,
-        driver_tx: mpsc::UnboundedSender<ResponseFrame>,
-        cluster_tx: mpsc::UnboundedSender<RequestFrame>,
+        responses_rx: flume::Receiver<ResponseFrame>,
+        driver_tx: flume::Sender<ResponseFrame>,
+        cluster_tx: flume::Sender<RequestFrame>,
         connection_no: usize,
         response_rules: Arc<Mutex<Vec<ResponseRule>>>,
         connection_close_signaler: ConnectionCloseSignaler,
         event_registered_flag: Arc<AtomicBool>,
     ) {
         let shard = self.shard;
-        self.run_until_interrupted("request_processor", |driver_addr, _, real_addr| async move {
+        self.run_until_interrupted("request_processor", |driver_addr, _, real_addr| Box::pin(async move {
             'mainloop: loop {
-                match responses_rx.recv().await {
-                    Some(response) => {
+                match responses_rx.recv_async().await {
+                    Ok(response) => {
                         let ctx = EvaluationContext {
                             connection_seq_no: connection_no,
                             opcode: FrameOpcode::Response(response.opcode),
@@ -1210,7 +1213,7 @@ impl ProxyWorker {
                                 let pass_action = async move {
                                     if let Some(ref pass_action) = to_addressee_action {
                                         if let Some(time) = pass_action.delay {
-                                            tokio::time::sleep(time).await;
+                                            sleep(time).await;
                                         }
                                         let passed_frame = match pass_action.msg_processor {
                                             Some(ref processor) => processor(response_clone),
@@ -1225,7 +1228,7 @@ impl ProxyWorker {
                                 let forge_action = async move {
                                     if let Some(ref forge_action) = to_sender_action {
                                         if let Some(time) = forge_action.delay {
-                                            tokio::time::sleep(time).await;
+                                            sleep(time).await;
                                         }
                                         let forged_frame = {
                                             let processor = forge_action.msg_processor.as_ref()
@@ -1241,7 +1244,7 @@ impl ProxyWorker {
                                 let drop_action = async move {
                                     if let Some(ref delay) = drop_connection_action {
                                         if let Some(ref time) = delay {
-                                            tokio::time::sleep(*time).await;
+                                            sleep(*time).await;
                                         }
                                         // close connection.
                                         info!(
@@ -1250,7 +1253,7 @@ impl ProxyWorker {
                                             real_addr.expect("BUG: response rules are unavailable for dry-mode proxy!"),
                                             DisplayableShard(shard)
                                         );
-                                        let _ = connection_close_signaler_clone.send(());
+                                        let _ = connection_close_signaler_clone.broadcast(());
                                     }
                                 };
 
@@ -1263,12 +1266,19 @@ impl ProxyWorker {
                         }
                         let _ = driver_tx.send(response); // default action
                     }
-                    None => return Ok(()),
+                    Err(_e) => return Ok(()),
                 }
             }
-        })
+        }))
         .await
     }
+}
+
+async fn sleep(duration: Duration) {
+    #[cfg(feature = "tokio_runtime")]
+    tokio::time::sleep(duration).await;
+    #[cfg(feature = "glommio_runtime")]
+    glommio::timer::sleep(duration).await;
 }
 
 // Returns next free IP address for another proxy instance.
@@ -1751,9 +1761,11 @@ mod tests {
 
         {
             // one run with custom rules
-            tokio::select! {
-                res = request(&mut driver, &mut node, params, opcode, &body) => panic!("Rules did not work: received response {:?}", res),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => (),
+            let mut req_fut =
+                Box::pin(request(&mut driver, &mut node, params, opcode, &body).fuse());
+            futures_util::select! {
+                res = req_fut => panic!("Rules did not work: received response {:?}", res),
+                _ = sleep(std::time::Duration::from_millis(20)).fuse() => (),
             };
         }
 
@@ -1847,9 +1859,9 @@ mod tests {
         }
 
         for _ in 0..FAILING_TRIES {
-            tokio::select! {
-                res = request(&mut driver, &mut node, params, opcode, &body) => panic!("Rules did not work: received response {:?}", res),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => (),
+            futures_util::select! {
+                res = request(&mut driver, &mut node, params, opcode, &body).fuse() => panic!("Rules did not work: received response {:?}", res),
+                _ = sleep(std::time::Duration::from_millis(10)).fuse() => (),
             };
         }
 
@@ -1868,9 +1880,9 @@ mod tests {
 
         for _ in 0..3 {
             // any further number of requests should fail
-            tokio::select! {
-                res = request(&mut driver, &mut node, params, opcode, &body) => panic!("Rules did not work: received response {:?}", res),
-                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => (),
+            futures_util::select! {
+                res = request(&mut driver, &mut node, params, opcode, &body).fuse() => panic!("Rules did not work: received response {:?}", res),
+                _ = sleep(std::time::Duration::from_millis(10)).fuse() => (),
             };
         }
 
@@ -1883,8 +1895,8 @@ mod tests {
         let node1_real_addr = next_local_address_with_port(9876);
         let node1_proxy_addr = next_local_address_with_port(9876);
 
-        let (request_feedback_tx, mut request_feedback_rx) = mpsc::unbounded_channel();
-        let (response_feedback_tx, mut response_feedback_rx) = mpsc::unbounded_channel();
+        let (request_feedback_tx, request_feedback_rx) = flume::unbounded();
+        let (response_feedback_tx, response_feedback_rx) = flume::unbounded();
         let proxy = Proxy::new([Node::new(
             node1_real_addr,
             node1_proxy_addr,
@@ -1931,14 +1943,14 @@ mod tests {
         // we keep the connections open until proxy finishes to let it perform clean exit with no disconnects
         let (_node_conn, _driver_conn) = join(mock_node_action, send_frame_to_shard).await;
 
-        let (feedback_request, _shard) = request_feedback_rx.recv().await.unwrap();
+        let (feedback_request, _shard) = request_feedback_rx.recv_async().await.unwrap();
         assert_eq!(feedback_request.params, params);
         assert_eq!(
             FrameOpcode::Request(feedback_request.opcode),
             request_opcode
         );
         assert_eq!(feedback_request.body, body);
-        let (feedback_response, _shard) = response_feedback_rx.recv().await.unwrap();
+        let (feedback_response, _shard) = response_feedback_rx.recv_async().await.unwrap();
         assert_eq!(feedback_response.params, params.for_response());
         assert_eq!(
             FrameOpcode::Response(feedback_response.opcode),
@@ -2093,7 +2105,7 @@ mod tests {
 
         write_frame(params, opcode, &body, &mut conn).await.unwrap();
         // We assert that after sufficiently long time, no error happens inside proxy.
-        tokio::time::sleep(Duration::from_millis(3)).await;
+        sleep(Duration::from_millis(3)).await;
         running_proxy.finish().await.unwrap();
     }
 
@@ -2229,8 +2241,8 @@ mod tests {
             let driver2_shard = shards_count - 2;
             let node_proxy_addr = next_local_address_with_port(node_port);
 
-            let (request_feedback_tx, mut request_feedback_rx) = mpsc::unbounded_channel();
-            let (response_feedback_tx, mut response_feedback_rx) = mpsc::unbounded_channel();
+            let (request_feedback_tx, request_feedback_rx) = flume::unbounded();
+            let (response_feedback_tx, response_feedback_rx) = flume::unbounded();
 
             let proxy = Proxy::new([Node::new(
                 node_real_addr,
@@ -2325,13 +2337,13 @@ mod tests {
                 assert_eq!(feedback_response.body, body);
             };
 
-            let (feedback_request, shard1) = request_feedback_rx.recv().await.unwrap();
+            let (feedback_request, shard1) = request_feedback_rx.recv_async().await.unwrap();
             assert_feedback_request(feedback_request);
-            let (feedback_request, shard2) = request_feedback_rx.recv().await.unwrap();
+            let (feedback_request, shard2) = request_feedback_rx.recv_async().await.unwrap();
             assert_feedback_request(feedback_request);
-            let (feedback_response, shard3) = response_feedback_rx.recv().await.unwrap();
+            let (feedback_response, shard3) = response_feedback_rx.recv_async().await.unwrap();
             assert_feedback_response(feedback_response);
-            let (feedback_response, shard4) = response_feedback_rx.recv().await.unwrap();
+            let (feedback_response, shard4) = response_feedback_rx.recv_async().await.unwrap();
             assert_feedback_response(feedback_response);
 
             // expected: {driver1_shard request, driver1_shard response, driver2_shard request, driver2_shard response}
@@ -2358,8 +2370,8 @@ mod tests {
         let node1_real_addr = next_local_address_with_port(9876);
         let node1_proxy_addr = next_local_address_with_port(9876);
 
-        let (request_feedback_tx, mut request_feedback_rx) = mpsc::unbounded_channel();
-        let (response_feedback_tx, mut response_feedback_rx) = mpsc::unbounded_channel();
+        let (request_feedback_tx, request_feedback_rx) = flume::unbounded();
+        let (response_feedback_tx, response_feedback_rx) = flume::unbounded();
         let proxy = Proxy::new([Node::new(
             node1_real_addr,
             node1_proxy_addr,
@@ -2461,9 +2473,9 @@ mod tests {
         running_proxy.finish().await.unwrap();
 
         for _ in 0..5 {
-            let (feedback_request, _shard) = request_feedback_rx.recv().await.unwrap();
+            let (feedback_request, _shard) = request_feedback_rx.recv_async().await.unwrap();
             assert_eq!(feedback_request.opcode, RequestOpcode::Query);
-            let (feedback_response, _shard) = response_feedback_rx.recv().await.unwrap();
+            let (feedback_response, _shard) = response_feedback_rx.recv_async().await.unwrap();
             assert_eq!(feedback_response.opcode, ResponseOpcode::Result);
         }
 

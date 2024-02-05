@@ -11,7 +11,7 @@ mod value_tests;
 
 use crate::frame::frame_errors::FrameError;
 use bytes::{Buf, BufMut, Bytes};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use futures_util::io::{AsyncRead, AsyncReadExt};
 use uuid::Uuid;
 
 use std::convert::TryFrom;
@@ -151,7 +151,7 @@ pub async fn read_response_frame(
 
     let mut raw_body = Vec::with_capacity(length).limit(length);
     while raw_body.has_remaining_mut() {
-        let n = reader.read_buf(&mut raw_body).await?;
+        let n = reader.read(&mut raw_body.get_mut()).await?;
         if n == 0 {
             // EOF, too early
             return Err(FrameError::ConnectionClosed(

@@ -27,7 +27,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use strum_macros::EnumString;
-use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
@@ -53,7 +52,7 @@ pub(crate) struct MetadataReader {
 
     // When a control connection breaks, the PoolRefiller of its pool uses the requester
     // to signal ClusterWorker that an immediate metadata refresh is advisable.
-    control_connection_repair_requester: broadcast::Sender<()>,
+    control_connection_repair_requester: async_broadcast::Sender<()>,
 }
 
 /// Describes all metadata retrieved from the cluster
@@ -402,10 +401,10 @@ impl MetadataReader {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
         initial_known_nodes: Vec<KnownNode>,
-        control_connection_repair_requester: broadcast::Sender<()>,
+        control_connection_repair_requester: async_broadcast::Sender<()>,
         mut connection_config: ConnectionConfig,
         keepalive_interval: Option<Duration>,
-        server_event_sender: mpsc::Sender<Event>,
+        server_event_sender: flume::Sender<Event>,
         keyspaces_to_fetch: Vec<String>,
         fetch_schema: bool,
         host_filter: &Option<Arc<dyn HostFilter>>,
@@ -673,7 +672,7 @@ impl MetadataReader {
         endpoint: UntranslatedEndpoint,
         connection_config: ConnectionConfig,
         keepalive_interval: Option<Duration>,
-        refresh_requester: broadcast::Sender<()>,
+        refresh_requester: async_broadcast::Sender<()>,
     ) -> NodeConnectionPool {
         let pool_config = PoolConfig {
             connection_config,
@@ -700,7 +699,7 @@ async fn query_metadata(
     let peers_query = query_peers(conn, connect_port);
     let keyspaces_query = query_keyspaces(conn, keyspace_to_fetch, fetch_schema);
 
-    let (peers, keyspaces) = tokio::try_join!(peers_query, keyspaces_query)?;
+    let (peers, keyspaces) = futures_util::try_join!(peers_query, keyspaces_query)?;
 
     // There must be at least one peer
     if peers.is_empty() {

@@ -1,5 +1,6 @@
 use bytes::Bytes;
-use futures::{future::RemoteHandle, FutureExt};
+use futures::future::RemoteHandle;
+use futures_util::{AsyncReadExt, FutureExt};
 use scylla_cql::errors::TranslationError;
 use scylla_cql::frame::request::options::Options;
 use scylla_cql::frame::response::Error;
@@ -8,19 +9,18 @@ use scylla_cql::types::serialize::batch::{BatchValues, BatchValuesIterator};
 use scylla_cql::types::serialize::raw_batch::RawBatchValuesAdapter;
 use scylla_cql::types::serialize::row::{RowSerializationContext, SerializedValues};
 use socket2::{SockRef, TcpKeepalive};
-use tokio::io::{split, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
-use tokio::net::{TcpSocket, TcpStream};
-use tokio::sync::{mpsc, oneshot};
-use tokio::time::Instant;
+
+use futures_util::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 use tracing::instrument::WithSubscriber;
 use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 
 use std::borrow::Cow;
+use std::net::{Ipv4Addr, Ipv6Addr};
 #[cfg(feature = "ssl")]
 use std::pin::Pin;
 use std::sync::atomic::AtomicU64;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(feature = "ssl")]
 use tokio_openssl::SslStream;
 
@@ -28,21 +28,20 @@ use tokio_openssl::SslStream;
 pub(crate) use ssl_config::SslConfig;
 
 use crate::authentication::AuthenticatorProvider;
+use async_compat::Compat;
 use scylla_cql::frame::response::authenticate::Authenticate;
+use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::TryFrom;
 use std::io::ErrorKind;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::{
-    cmp::Ordering,
-    net::{Ipv4Addr, Ipv6Addr},
-};
 
 use super::errors::{BadKeyspaceName, DbError, QueryError};
 use super::iterator::RowIterator;
 use super::session::AddressTranslator;
+
 use super::topology::{PeerEndpoint, UntranslatedEndpoint, UntranslatedPeer};
 use super::NodeAddr;
 #[cfg(feature = "cloud")]
@@ -63,7 +62,7 @@ use crate::statement::prepared_statement::PreparedStatement;
 use crate::statement::Consistency;
 use crate::transport::session::IntoTypedRows;
 use crate::transport::Compression;
-use crate::QueryResult;
+use crate::{util, QueryResult};
 
 // Queries for schema agreement
 const LOCAL_VERSION: &str = "SELECT schema_version FROM system.local WHERE key='local'";
@@ -87,7 +86,7 @@ pub(crate) struct Connection {
 }
 
 struct RouterHandle {
-    submit_channel: mpsc::Sender<Task>,
+    submit_channel: flume::Sender<Task>,
 
     // Each request send by `Connection::send_request` needs a unique request id.
     // This field is a monotonic generator of such ids.
@@ -97,7 +96,7 @@ struct RouterHandle {
     // Also, this sender is unbounded, because only unbounded channels support
     // pushing values in a synchronous way (without an `.await`), which is
     // needed for pushing values in `Drop` implementations.
-    orphan_notification_sender: mpsc::UnboundedSender<RequestId>,
+    orphan_notification_sender: flume::Sender<RequestId>,
 }
 
 impl RouterHandle {
@@ -115,7 +114,7 @@ impl RouterHandle {
         let serialized_request = SerializedRequest::make(request, compression, tracing)?;
         let request_id = self.allocate_request_id();
 
-        let (response_sender, receiver) = oneshot::channel();
+        let (response_sender, receiver) = flume::bounded(1);
         let response_handler = ResponseHandler {
             response_sender,
             request_id,
@@ -127,7 +126,7 @@ impl RouterHandle {
         let notifier = OrphanhoodNotifier::new(request_id, &self.orphan_notification_sender);
 
         self.submit_channel
-            .send(Task {
+            .send_async(Task {
                 serialized_request,
                 response_handler,
             })
@@ -139,7 +138,7 @@ impl RouterHandle {
                 )))
             })?;
 
-        let task_response = receiver.await.map_err(|_| {
+        let task_response = receiver.recv_async().await.map_err(|_| {
             QueryError::IoError(Arc::new(std::io::Error::new(
                 ErrorKind::Other,
                 "Connection broken",
@@ -164,7 +163,7 @@ pub(crate) struct ConnectionFeatures {
 type RequestId = u64;
 
 struct ResponseHandler {
-    response_sender: oneshot::Sender<Result<TaskResponse, QueryError>>,
+    response_sender: flume::Sender<Result<TaskResponse, QueryError>>,
     request_id: RequestId,
 }
 
@@ -173,14 +172,11 @@ struct ResponseHandler {
 struct OrphanhoodNotifier<'a> {
     enabled: bool,
     request_id: RequestId,
-    notification_sender: &'a mpsc::UnboundedSender<RequestId>,
+    notification_sender: &'a flume::Sender<RequestId>,
 }
 
 impl<'a> OrphanhoodNotifier<'a> {
-    fn new(
-        request_id: RequestId,
-        notification_sender: &'a mpsc::UnboundedSender<RequestId>,
-    ) -> Self {
+    fn new(request_id: RequestId, notification_sender: &'a flume::Sender<RequestId>) -> Self {
         Self {
             enabled: true,
             request_id,
@@ -356,7 +352,7 @@ pub struct ConnectionConfig {
     pub ssl_config: Option<SslConfig>,
     pub connect_timeout: std::time::Duration,
     // should be Some only in control connections,
-    pub event_sender: Option<mpsc::Sender<Event>>,
+    pub event_sender: Option<flume::Sender<Event>>,
     pub default_consistency: Consistency,
     #[cfg(feature = "cloud")]
     pub(crate) cloud_config: Option<Arc<CloudConfig>>,
@@ -409,7 +405,7 @@ impl ConnectionConfig {
 }
 
 // Used to listen for fatal error in connection
-pub(crate) type ErrorReceiver = tokio::sync::oneshot::Receiver<QueryError>;
+pub(crate) type ErrorReceiver = flume::Receiver<QueryError>;
 
 impl Connection {
     // Returns new connection and ErrorReceiver which can be used to wait for a fatal error
@@ -420,10 +416,9 @@ impl Connection {
     ) -> Result<(Self, ErrorReceiver), QueryError> {
         let stream_connector = match source_port {
             Some(p) => {
-                tokio::time::timeout(config.connect_timeout, connect_with_source_port(addr, p))
-                    .await
+                util::timeout(config.connect_timeout, connect_with_source_port(addr, p)).await
             }
-            None => tokio::time::timeout(config.connect_timeout, TcpStream::connect(addr)).await,
+            None => util::timeout(config.connect_timeout, connect_with_source_port(addr, 0)).await,
         };
         let stream = match stream_connector {
             Ok(stream) => stream?,
@@ -431,6 +426,7 @@ impl Connection {
                 return Err(QueryError::TimeoutError);
             }
         };
+        #[cfg(feature = "tokio_runtime")]
         stream.set_nodelay(config.tcp_nodelay)?;
 
         if let Some(tcp_keepalive_interval) = config.tcp_keepalive_interval {
@@ -478,15 +474,18 @@ impl Connection {
                 tcp_keepalive = tcp_keepalive.with_retries(10);
             }
 
-            let sf = SockRef::from(&stream);
-            sf.set_tcp_keepalive(&tcp_keepalive)?;
+            #[cfg(feature = "tokio_runtime")]
+            {
+                let sf = SockRef::from(&stream);
+                sf.set_tcp_keepalive(&tcp_keepalive)?;
+            }
         }
 
         // TODO: What should be the size of the channel?
-        let (sender, receiver) = mpsc::channel(1024);
-        let (error_sender, error_receiver) = tokio::sync::oneshot::channel();
+        let (sender, receiver) = flume::bounded(1024);
+        let (error_sender, error_receiver) = flume::bounded(1);
         // Unbounded because it allows for synchronous pushes
-        let (orphan_notification_sender, orphan_notification_receiver) = mpsc::unbounded_channel();
+        let (orphan_notification_sender, orphan_notification_receiver) = flume::unbounded();
 
         let router_handle = Arc::new(RouterHandle {
             submit_channel: sender,
@@ -725,10 +724,10 @@ impl Connection {
 
     /// Executes a query and fetches its results over multiple pages, using
     /// the asynchronous iterator interface.
-    pub(crate) async fn query_iter(
+    pub(crate) async fn query_iter<'a>(
         self: Arc<Self>,
         query: Query,
-    ) -> Result<RowIterator, QueryError> {
+    ) -> Result<RowIterator<'a>, QueryError> {
         let consistency = query
             .config
             .determine_consistency(self.config.default_consistency);
@@ -740,11 +739,11 @@ impl Connection {
 
     /// Executes a prepared statements and fetches its results over multiple pages, using
     /// the asynchronous iterator interface.
-    pub(crate) async fn execute_iter(
+    pub(crate) async fn execute_iter<'a>(
         self: Arc<Self>,
         prepared_statement: PreparedStatement,
         values: SerializedValues,
-    ) -> Result<RowIterator, QueryError> {
+    ) -> Result<RowIterator<'a>, QueryError> {
         let consistency = prepared_statement
             .config
             .determine_consistency(self.config.default_consistency);
@@ -1005,16 +1004,17 @@ impl Connection {
         })
     }
 
+    #[cfg(feature = "glommio_runtime")]
     async fn run_router(
         config: ConnectionConfig,
-        stream: TcpStream,
-        receiver: mpsc::Receiver<Task>,
-        error_sender: tokio::sync::oneshot::Sender<QueryError>,
-        orphan_notification_receiver: mpsc::UnboundedReceiver<RequestId>,
+        stream: glommio::net::TcpStream,
+        receiver: flume::Receiver<Task>,
+        error_sender: flume::Sender<QueryError>,
+        orphan_notification_receiver: flume::Receiver<RequestId>,
         router_handle: Arc<RouterHandle>,
         node_address: IpAddr,
     ) -> Result<RemoteHandle<()>, std::io::Error> {
-        #[cfg(feature = "ssl")]
+        #[cfg(feature = "futures_ssl")]
         if let Some(ssl_config) = &config.ssl_config {
             let ssl = ssl_config.new_ssl()?;
             let mut stream = SslStream::new(ssl, stream)?;
@@ -1030,7 +1030,7 @@ impl Connection {
                 node_address,
             )
             .remote_handle();
-            tokio::task::spawn(task.with_current_subscriber());
+            util::spawn(task.with_current_subscriber());
             return Ok(handle);
         }
 
@@ -1044,20 +1044,66 @@ impl Connection {
             node_address,
         )
         .remote_handle();
-        tokio::task::spawn(task.with_current_subscriber());
+        util::spawn(task.with_current_subscriber());
+        Ok(handle)
+    }
+
+    #[cfg(feature = "tokio_runtime")]
+    async fn run_router(
+        config: ConnectionConfig,
+        stream: tokio::net::TcpStream,
+        receiver: flume::Receiver<Task>,
+        error_sender: flume::Sender<QueryError>,
+        orphan_notification_receiver: flume::Receiver<RequestId>,
+        router_handle: Arc<RouterHandle>,
+        node_address: IpAddr,
+    ) -> Result<RemoteHandle<()>, std::io::Error> {
+        #[cfg(feature = "ssl")]
+        if let Some(ssl_config) = &config.ssl_config {
+            let ssl = ssl_config.new_ssl()?;
+            let mut stream = SslStream::new(ssl, stream)?;
+            let _pin = Pin::new(&mut stream).connect().await;
+
+            let stream = Compat::new(stream);
+            let (task, handle) = Self::router(
+                config,
+                stream,
+                receiver,
+                error_sender,
+                orphan_notification_receiver,
+                router_handle,
+                node_address,
+            )
+            .remote_handle();
+            util::spawn(task.with_current_subscriber());
+            return Ok(handle);
+        }
+
+        let stream = Compat::new(stream);
+        let (task, handle) = Self::router(
+            config,
+            stream,
+            receiver,
+            error_sender,
+            orphan_notification_receiver,
+            router_handle,
+            node_address,
+        )
+        .remote_handle();
+        util::spawn(task.with_current_subscriber());
         Ok(handle)
     }
 
     async fn router(
         config: ConnectionConfig,
         stream: (impl AsyncRead + AsyncWrite),
-        receiver: mpsc::Receiver<Task>,
-        error_sender: tokio::sync::oneshot::Sender<QueryError>,
-        orphan_notification_receiver: mpsc::UnboundedReceiver<RequestId>,
+        receiver: flume::Receiver<Task>,
+        error_sender: flume::Sender<QueryError>,
+        orphan_notification_receiver: flume::Receiver<RequestId>,
         router_handle: Arc<RouterHandle>,
         node_address: IpAddr,
     ) {
-        let (read_half, write_half) = split(stream);
+        let (read_half, write_half) = stream.split();
         // Why are we using a mutex here?
         //
         // The handler_map is supposed to be shared between reader and writer
@@ -1199,13 +1245,13 @@ impl Connection {
     async fn writer(
         mut write_half: (impl AsyncWrite + Unpin),
         handler_map: &StdMutex<ResponseHandlerMap>,
-        mut task_receiver: mpsc::Receiver<Task>,
+        task_receiver: flume::Receiver<Task>,
         enable_write_coalescing: bool,
     ) -> Result<(), QueryError> {
         // When the Connection object is dropped, the sender half
         // of the channel will be dropped, this task will return an error
         // and the whole worker will be stopped
-        while let Some(mut task) = task_receiver.recv().await {
+        while let Ok(mut task) = task_receiver.recv_async().await {
             let mut num_requests = 0;
             let mut total_sent = 0;
             while let Some(stream_id) = Self::alloc_stream_id(handler_map, task.response_handler) {
@@ -1221,7 +1267,10 @@ impl Connection {
                         // Yielding was empirically tested to inject a 1-300µs delay,
                         // much better than tokio::time::sleep's 1ms granularity.
                         // Also, yielding in a busy system let's the queue catch up with new items.
+                        #[cfg(feature = "tokio_runtime")]
                         tokio::task::yield_now().await;
+                        #[cfg(feature = "glommio_runtime")]
+                        glommio::yield_if_needed().await;
                         match task_receiver.try_recv() {
                             Ok(t) => t,
                             Err(_) => break,
@@ -1243,12 +1292,14 @@ impl Connection {
     // causing the connection to break.
     async fn orphaner(
         handler_map: &StdMutex<ResponseHandlerMap>,
-        mut orphan_receiver: mpsc::UnboundedReceiver<RequestId>,
+        orphan_receiver: flume::Receiver<RequestId>,
     ) -> Result<(), QueryError> {
-        let mut interval = tokio::time::interval(OLD_AGE_ORPHAN_THRESHOLD);
+        let mut interval = util::interval(OLD_AGE_ORPHAN_THRESHOLD);
+        let mut tick_fut = Box::pin(interval.tick().fuse());
+        let mut recv_fut = Box::pin(orphan_receiver.recv_async().fuse());
         loop {
-            tokio::select! {
-                _ = interval.tick() => {
+            futures_util::select! {
+                _ = tick_fut => {
                     // We are guaranteed here that handler_map will not be locked
                     // by anybody else, so we can do try_lock().unwrap()
                     let handler_map_guard = handler_map.try_lock().unwrap();
@@ -1261,15 +1312,22 @@ impl Connection {
                         return Err(QueryError::TooManyOrphanedStreamIds(old_orphan_count as u16))
                     }
                 }
-                Some(request_id) = orphan_receiver.recv() => {
-                    trace!(
-                        "Trying to orphan stream id associated with request_id = {}",
-                        request_id,
-                    );
-                    let mut handler_map_guard = handler_map.try_lock().unwrap(); // Same as above
-                    handler_map_guard.orphan(request_id);
+                request_id = recv_fut => {
+                    match request_id {
+                        Ok(request_id) => {
+                            trace!(
+                                "Trying to orphan stream id associated with request_id = {}",
+                                request_id,
+                            );
+                            let mut handler_map_guard = handler_map.try_lock().unwrap(); // Same as above
+                            handler_map_guard.orphan(request_id);
+                        }
+                        Err(e) => {
+                            error!("error: {:?}", e);
+                        }
+                    }
                 }
-                else => { break }
+                default => { break }
             }
         }
 
@@ -1290,18 +1348,18 @@ impl Connection {
         }
 
         if let Some(keepalive_interval) = keepalive_interval {
-            let mut interval = tokio::time::interval(keepalive_interval);
+            let mut interval = util::interval(keepalive_interval);
             interval.tick().await; // Use up the first, instant tick.
 
             // Default behaviour (Burst) is not suitable for sending keepalives.
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            interval.set_missed_tick_behavior(util::MissedTickBehavior::Delay);
 
             loop {
                 interval.tick().await;
 
                 let keepalive_query = issue_keepalive_query(&router_handle);
                 let query_result = if let Some(timeout) = keepalive_timeout {
-                    match tokio::time::timeout(timeout, keepalive_query).await {
+                    match util::timeout(timeout, keepalive_query).await {
                         Ok(res) => res,
                         Err(_) => {
                             warn!(
@@ -1337,7 +1395,7 @@ impl Connection {
     async fn handle_event(
         task_response: TaskResponse,
         compression: Option<Compression>,
-        event_sender: &mpsc::Sender<Event>,
+        event_sender: &flume::Sender<Event>,
     ) -> Result<(), QueryError> {
         // Protocol features are negotiated during connection handshake.
         // However, the router is already created and sent to a different tokio
@@ -1359,7 +1417,7 @@ impl Connection {
             }
         };
 
-        event_sender.send(event).await.map_err(|_| {
+        event_sender.send_async(event).await.map_err(|_| {
             QueryError::IoError(Arc::new(std::io::Error::new(
                 ErrorKind::Other,
                 "Connection broken",
@@ -1586,13 +1644,29 @@ async fn perform_authenticate(
     Ok(())
 }
 
+#[cfg(feature = "glommio_runtime")]
 async fn connect_with_source_port(
     addr: SocketAddr,
     source_port: u16,
-) -> Result<TcpStream, std::io::Error> {
+) -> Result<glommio::net::TcpStream, std::io::Error> {
+    let addr = match addr {
+        SocketAddr::V4(_) => SocketAddr::new(Ipv4Addr::new(0, 0, 0, 0).into(), source_port),
+        SocketAddr::V6(_) => {
+            SocketAddr::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0).into(), source_port)
+        }
+    };
+    let socket = glommio::net::TcpStream::connect(addr).await?;
+    Ok(socket)
+}
+
+#[cfg(feature = "tokio_runtime")]
+async fn connect_with_source_port(
+    addr: SocketAddr,
+    source_port: u16,
+) -> Result<tokio::net::TcpStream, std::io::Error> {
     match addr {
         SocketAddr::V4(_) => {
-            let socket = TcpSocket::new_v4()?;
+            let socket = tokio::net::TcpSocket::new_v4()?;
             socket.bind(SocketAddr::new(
                 Ipv4Addr::new(0, 0, 0, 0).into(),
                 source_port,
@@ -1600,7 +1674,7 @@ async fn connect_with_source_port(
             Ok(socket.connect(addr).await?)
         }
         SocketAddr::V6(_) => {
-            let socket = TcpSocket::new_v6()?;
+            let socket = tokio::net::TcpSocket::new_v6()?;
             socket.bind(SocketAddr::new(
                 Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0).into(),
                 source_port,
@@ -1830,6 +1904,7 @@ impl VerifiedKeyspaceName {
 #[cfg(test)]
 mod tests {
     use assert_matches::assert_matches;
+    use futures_util::FutureExt;
     use scylla_cql::errors::QueryError;
     use scylla_cql::frame::protocol_features::{
         LWT_OPTIMIZATION_META_BIT_MASK_KEY, SCYLLA_LWT_ADD_METADATA_MARK_EXTENSION,
@@ -1839,9 +1914,6 @@ mod tests {
         Condition, Node, Proxy, Reaction, RequestFrame, RequestOpcode, RequestReaction,
         RequestRule, ResponseFrame, ShardAwareness,
     };
-
-    use tokio::select;
-    use tokio::sync::mpsc;
 
     use super::ConnectionConfig;
     use crate::query::Query;
@@ -2100,7 +2172,7 @@ mod tests {
 
         let config = ConnectionConfig::default();
 
-        let (startup_tx, mut startup_rx) = mpsc::unbounded_channel();
+        let (startup_tx, mut startup_rx) = flume::unbounded();
 
         let options_without_lwt_optimisation_support = HashMap::<String, Vec<String>>::new();
         let options_with_lwt_optimisation_support = [(
@@ -2138,17 +2210,17 @@ mod tests {
             .unwrap();
 
         // We must interrupt the driver's full connection opening, because our proxy does not interact further after Startup.
-        let (startup_without_lwt_optimisation, _shard) = select! {
-            _ = open_connection(UntranslatedEndpoint::ContactPoint(ResolvedContactPoint{address: proxy_addr, datacenter: None}), None, config.clone()) => unreachable!(),
-            startup = startup_rx.recv() => startup.unwrap(),
+        let (startup_without_lwt_optimisation, _shard) = futures_util::select! {
+            _ = open_connection(UntranslatedEndpoint::ContactPoint(ResolvedContactPoint{address: proxy_addr, datacenter: None}), None, config.clone()).fuse() => unreachable!(),
+            startup = startup_rx.recv_async().fuse() => startup.unwrap(),
         };
 
         proxy.running_nodes[0]
             .change_request_rules(Some(make_rules(options_with_lwt_optimisation_support)));
 
-        let (startup_with_lwt_optimisation, _shard) = select! {
-            _ = open_connection(UntranslatedEndpoint::ContactPoint(ResolvedContactPoint{address: proxy_addr, datacenter: None}), None, config.clone()) => unreachable!(),
-            startup = startup_rx.recv() => startup.unwrap(),
+        let (startup_with_lwt_optimisation, _shard) = futures_util::select! {
+            _ = open_connection(UntranslatedEndpoint::ContactPoint(ResolvedContactPoint{address: proxy_addr, datacenter: None}), None, config.clone()).fuse() => unreachable!(),
+            startup = startup_rx.recv_async().fuse() => startup.unwrap(),
         };
 
         let _ = proxy.finish().await;
@@ -2220,17 +2292,14 @@ mod tests {
                 .unwrap();
         }
         // As everything is normal, no error should have been reported.
-        assert_matches!(
-            error_receiver.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        );
+        assert_matches!(error_receiver.try_recv(), Err(flume::TryRecvError::Empty));
 
         // Set up proxy to drop keepalive messages
         proxy.running_nodes[0].change_request_rules(Some(vec![drop_options_rule]));
 
         // Wait until keepaliver gots impatient and terminates router.
         // Then, the error from keepaliver will be propagated to the error receiver.
-        let err = error_receiver.await.unwrap();
+        let err = error_receiver.recv_async().await.unwrap();
         assert_matches!(err, QueryError::IoError(_));
 
         // As the router is invalidated, all further queries should immediately

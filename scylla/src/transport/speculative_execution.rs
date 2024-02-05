@@ -5,6 +5,8 @@ use futures::{
 use std::{future::Future, sync::Arc, time::Duration};
 use tracing::{trace_span, warn, Instrument};
 
+use crate::util;
+
 use super::{errors::QueryError, metrics::Metrics};
 
 /// Context is passed as an argument to `SpeculativeExecutionPolicy` methods
@@ -108,8 +110,8 @@ where
             .instrument(trace_span!("Speculative execution: original query")),
     );
 
-    let sleep = tokio::time::sleep(retry_interval).fuse();
-    tokio::pin!(sleep);
+    let sleep = util::sleep(retry_interval).fuse();
+    futures_util::pin_mut!(sleep);
 
     let mut last_error = None;
     loop {
@@ -120,7 +122,7 @@ where
                     retries_remaining -= 1;
 
                     // reset the timeout
-                    sleep.set(tokio::time::sleep(retry_interval).fuse());
+                    sleep.set(util::sleep(retry_interval).fuse());
                 }
             }
             res = async_tasks.select_next_some() => {

@@ -2132,11 +2132,11 @@ mod latency_awareness {
     use futures::{future::RemoteHandle, FutureExt};
     use itertools::Either;
     use scylla_cql::errors::{DbError, QueryError};
-    use tokio::time::{Duration, Instant};
+    use std::time::{Duration, Instant};
     use tracing::{instrument::WithSubscriber, trace, warn};
     use uuid::Uuid;
 
-    use crate::{load_balancing::NodeRef, transport::node::Node};
+    use crate::{load_balancing::NodeRef, transport::node::Node, util};
     use std::{
         collections::HashMap,
         ops::Deref,
@@ -2311,14 +2311,14 @@ mod latency_awareness {
             );
 
             let (updater_fut, updater_handle) = async move {
-                let mut update_scheduler = tokio::time::interval(update_rate);
+                let mut update_scheduler = util::interval(update_rate);
                 loop {
                     update_scheduler.tick().await;
                     updater.tick().await;
                 }
             }
             .remote_handle();
-            tokio::task::spawn(updater_fut.with_current_subscriber());
+            util::spawn(updater_fut.with_current_subscriber());
 
             Self {
                 _updater_handle: Some(updater_handle),
@@ -2759,7 +2759,7 @@ mod latency_awareness {
             },
             ExecutionProfile,
         };
-        use tokio::time::Instant;
+        use std::time::Instant;
 
         trait DefaultPolicyTestExt {
             fn set_nodes_latency_stats(

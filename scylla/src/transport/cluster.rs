@@ -11,6 +11,7 @@ use crate::transport::{
     partitioner::PartitionerName,
     topology::{Keyspace, Metadata, MetadataReader},
 };
+use crate::util;
 
 use arc_swap::ArcSwap;
 use futures::future::join_all;
@@ -39,8 +40,8 @@ pub(crate) struct Cluster {
     // between `Cluster` and `ClusterWorker`
     data: Arc<ArcSwap<ClusterData>>,
 
-    refresh_channel: tokio::sync::mpsc::Sender<RefreshRequest>,
-    use_keyspace_channel: tokio::sync::mpsc::Sender<UseKeyspaceRequest>,
+    refresh_channel: flume::Sender<RefreshRequest>,
+    use_keyspace_channel: flume::Sender<UseKeyspaceRequest>,
 
     _worker_handle: RemoteHandle<()>,
 }
@@ -103,16 +104,16 @@ struct ClusterWorker {
     pool_config: PoolConfig,
 
     // To listen for refresh requests
-    refresh_channel: tokio::sync::mpsc::Receiver<RefreshRequest>,
+    refresh_channel: flume::Receiver<RefreshRequest>,
 
     // Channel used to receive use keyspace requests
-    use_keyspace_channel: tokio::sync::mpsc::Receiver<UseKeyspaceRequest>,
+    use_keyspace_channel: flume::Receiver<UseKeyspaceRequest>,
 
     // Channel used to receive server events
-    server_events_channel: tokio::sync::mpsc::Receiver<Event>,
+    server_events_channel: flume::Receiver<Event>,
 
     // Channel used to receive signals that control connection is broken
-    control_connection_repair_channel: tokio::sync::broadcast::Receiver<()>,
+    control_connection_repair_channel: async_broadcast::Receiver<()>,
 
     // Keyspace send in "USE <keyspace name>" when opening each connection
     used_keyspace: Option<VerifiedKeyspaceName>,
@@ -128,13 +129,13 @@ struct ClusterWorker {
 
 #[derive(Debug)]
 struct RefreshRequest {
-    response_chan: tokio::sync::oneshot::Sender<Result<(), QueryError>>,
+    response_chan: flume::Sender<Result<(), QueryError>>,
 }
 
 #[derive(Debug)]
 struct UseKeyspaceRequest {
     keyspace_name: VerifiedKeyspaceName,
-    response_chan: tokio::sync::oneshot::Sender<Result<(), QueryError>>,
+    response_chan: flume::Sender<Result<(), QueryError>>,
 }
 
 impl Cluster {
@@ -146,11 +147,11 @@ impl Cluster {
         host_filter: Option<Arc<dyn HostFilter>>,
         cluster_metadata_refresh_interval: Duration,
     ) -> Result<Cluster, NewSessionError> {
-        let (refresh_sender, refresh_receiver) = tokio::sync::mpsc::channel(32);
-        let (use_keyspace_sender, use_keyspace_receiver) = tokio::sync::mpsc::channel(32);
-        let (server_events_sender, server_events_receiver) = tokio::sync::mpsc::channel(32);
+        let (refresh_sender, refresh_receiver) = flume::bounded(32);
+        let (use_keyspace_sender, use_keyspace_receiver) = flume::bounded(32);
+        let (server_events_sender, server_events_receiver) = flume::bounded(32);
         let (control_connection_repair_sender, control_connection_repair_receiver) =
-            tokio::sync::broadcast::channel(32);
+            async_broadcast::broadcast(32);
 
         let mut metadata_reader = MetadataReader::new(
             known_nodes,
@@ -195,7 +196,7 @@ impl Cluster {
         };
 
         let (fut, worker_handle) = worker.work().remote_handle();
-        tokio::spawn(fut.with_current_subscriber());
+        util::spawn(fut.with_current_subscriber());
 
         let result = Cluster {
             data: cluster_data,
@@ -212,10 +213,10 @@ impl Cluster {
     }
 
     pub(crate) async fn refresh_metadata(&self) -> Result<(), QueryError> {
-        let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+        let (response_sender, response_receiver) = flume::bounded(1);
 
         self.refresh_channel
-            .send(RefreshRequest {
+            .send_async(RefreshRequest {
                 response_chan: response_sender,
             })
             .await
@@ -223,6 +224,7 @@ impl Cluster {
         // Other end of this channel is in ClusterWorker, can't be dropped while we have &self to Cluster with _worker_handle
 
         response_receiver
+            .recv_async()
             .await
             .expect("Bug in Cluster::refresh_metadata receiving")
         // ClusterWorker always responds
@@ -232,10 +234,10 @@ impl Cluster {
         &self,
         keyspace_name: VerifiedKeyspaceName,
     ) -> Result<(), QueryError> {
-        let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+        let (response_sender, response_receiver) = flume::bounded(1);
 
         self.use_keyspace_channel
-            .send(UseKeyspaceRequest {
+            .send_async(UseKeyspaceRequest {
                 keyspace_name,
                 response_chan: response_sender,
             })
@@ -243,7 +245,7 @@ impl Cluster {
             .expect("Bug in Cluster::use_keyspace sending");
         // Other end of this channel is in ClusterWorker, can't be dropped while we have &self to Cluster with _worker_handle
 
-        response_receiver.await.unwrap() // ClusterWorker always responds
+        response_receiver.recv_async().await.unwrap() // ClusterWorker always responds
     }
 }
 
@@ -339,13 +341,12 @@ impl ClusterData {
         Self::update_rack_count(&mut datacenters);
 
         let keyspaces = metadata.keyspaces;
-        let (locator, keyspaces) = tokio::task::spawn_blocking(move || {
+        let (locator, keyspaces) = util::spawn_blocking(move || {
             let keyspace_strategies = keyspaces.values().map(|ks| &ks.strategy);
             let locator = ReplicaLocator::new(ring.into_iter(), keyspace_strategies);
             (locator, keyspaces)
         })
-        .await
-        .unwrap();
+        .await;
 
         ClusterData {
             known_peers: new_known_peers,
@@ -477,12 +478,13 @@ impl ClusterData {
 
 impl ClusterWorker {
     pub(crate) async fn work(mut self) {
-        use tokio::time::Instant;
+        use std::time::Instant;
 
         let control_connection_repair_duration = Duration::from_secs(1); // Attempt control connection repair every second
         let mut last_refresh_time = Instant::now();
         let mut control_connection_works = true;
 
+        //let mut broadcast_recv = self.control_connection_repair_channel.recv().fuse();
         loop {
             let mut cur_request: Option<RefreshRequest> = None;
 
@@ -495,19 +497,18 @@ impl ClusterWorker {
                 })
                 .unwrap_or_else(Instant::now);
 
-            let sleep_future = tokio::time::sleep_until(sleep_until);
-            tokio::pin!(sleep_future);
+            let mut sleep_future = Box::pin(util::sleep_until(sleep_until).fuse());
 
-            tokio::select! {
+            futures_util::select! {
                 _ = sleep_future => {},
-                recv_res = self.refresh_channel.recv() => {
+                recv_res = self.refresh_channel.recv_async() => {
                     match recv_res {
-                        Some(request) => cur_request = Some(request),
-                        None => return, // If refresh_channel was closed then cluster was dropped, we can stop working
+                        Ok(request) => cur_request = Some(request),
+                        Err(_e) => return, // If refresh_channel was closed then cluster was dropped, we can stop working
                     }
                 }
-                recv_res = self.server_events_channel.recv() => {
-                    if let Some(event) = recv_res {
+                recv_res = self.server_events_channel.recv_async() => {
+                    if let Ok(event) = recv_res {
                         debug!("Received server event: {:?}", event);
                         match event {
                             Event::TopologyChange(_) => (), // Refresh immediately
@@ -529,21 +530,21 @@ impl ClusterWorker {
                         return;
                     }
                 }
-                recv_res = self.use_keyspace_channel.recv() => {
+                recv_res = self.use_keyspace_channel.recv_async() => {
                     match recv_res {
-                        Some(request) => {
+                        Ok(request) => {
                             self.used_keyspace = Some(request.keyspace_name.clone());
 
                             let cluster_data = self.cluster_data.load_full();
                             let use_keyspace_future = Self::handle_use_keyspace_request(cluster_data, request);
-                            tokio::spawn(use_keyspace_future.with_current_subscriber());
+                            util::spawn(use_keyspace_future.with_current_subscriber());
                         },
-                        None => return, // If use_keyspace_channel was closed then cluster was dropped, we can stop working
+                        Err(_e) => return, // If use_keyspace_channel was closed then cluster was dropped, we can stop working
                     }
 
                     continue; // Don't go to refreshing, wait for the next event
                 }
-                recv_res = self.control_connection_repair_channel.recv() => {
+                recv_res = self.control_connection_repair_channel.recv().fuse() => {
                     match recv_res {
                         Ok(()) => {
                             // The control connection was broken. Acknowledge that and start attempting to reconnect.
@@ -551,12 +552,12 @@ impl ClusterWorker {
                             // and if it does not succeed, then `control_connection_works` will be set to `false`,
                             // so subsequent attempts will be issued every second.
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        Err(async_broadcast::RecvError::Overflowed(_)) => {
                             // This is very unlikely; we would have to have a lot of concurrent
                             // control connections opened and broken at the same time.
                             // The best we can do is ignoring this.
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        Err(async_broadcast::RecvError::Closed) => {
                             // If control_connection_repair_channel was closed then MetadataReader was dropped,
                             // we can stop working.
                             return;

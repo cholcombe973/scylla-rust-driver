@@ -115,6 +115,7 @@ pub mod statement;
 pub mod tracing;
 pub mod transport;
 
+pub(crate) mod util;
 pub(crate) mod utils;
 
 /// This module is NOT part of the public API (it is `pub` only for internal use of integration tests).

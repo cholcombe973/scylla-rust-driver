@@ -53,7 +53,7 @@ where
     }
 }
 
-impl<S> CachingSession<S>
+impl<'a, S> CachingSession<S>
 where
     S: BuildHasher + Clone,
 {
@@ -83,7 +83,7 @@ where
         &self,
         query: impl Into<Query>,
         values: impl SerializeRow,
-    ) -> Result<RowIterator, QueryError> {
+    ) -> Result<RowIterator<'a>, QueryError> {
         let query = query.into();
         let prepared = self.add_prepared_statement_owned(query).await?;
         self.session.execute_iter(prepared, values).await

@@ -5,9 +5,9 @@ use crate::batch::batch_values;
 #[cfg(feature = "cloud")]
 use crate::cloud::CloudConfig;
 
-use crate::history;
 use crate::history::HistoryListener;
 use crate::utils::pretty::{CommaSeparatedDisplayer, CqlValueDisplayer};
+use crate::{history, util};
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -30,7 +30,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::timeout;
 use tracing::{debug, trace, trace_span, Instrument};
 use uuid::Uuid;
 
@@ -790,11 +789,11 @@ impl Session {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn query_iter(
+    pub async fn query_iter<'a>(
         &self,
         query: impl Into<Query>,
         values: impl SerializeRow,
-    ) -> Result<RowIterator, QueryError> {
+    ) -> Result<RowIterator<'a>, QueryError> {
         let query: Query = query.into();
 
         let execution_profile = query
@@ -1113,11 +1112,11 @@ impl Session {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn execute_iter(
+    pub async fn execute_iter<'a>(
         &self,
         prepared: impl Into<PreparedStatement>,
         values: impl SerializeRow,
-    ) -> Result<RowIterator, QueryError> {
+    ) -> Result<RowIterator<'a>, QueryError> {
         let prepared = prepared.into();
         let serialized_values = prepared.serialize_values(&values)?;
 
@@ -1413,7 +1412,7 @@ impl Session {
 
             match current_try {
                 Some(tracing_info) => return Ok(tracing_info),
-                None => tokio::time::sleep(self.tracing_info_fetch_interval).await,
+                None => util::sleep(self.tracing_info_fetch_interval).await,
             };
         }
 
@@ -1458,7 +1457,7 @@ impl Session {
         traces_events_query.config.consistency = consistency;
         traces_events_query.set_page_size(1024);
 
-        let (traces_session_res, traces_events_res) = tokio::try_join!(
+        let (traces_session_res, traces_events_res) = futures_util::try_join!(
             self.query(traces_session_query, (tracing_id,)),
             self.query(traces_events_query, (tracing_id,))
         )?;
@@ -1661,16 +1660,15 @@ impl Session {
         let effective_timeout = statement_config
             .request_timeout
             .or(execution_profile.request_timeout);
+
         let result = match effective_timeout {
-            Some(timeout) => tokio::time::timeout(timeout, runner)
-                .await
-                .unwrap_or_else(|e| {
-                    Err(QueryError::RequestTimeout(format!(
-                        "Request took longer than {}ms: {}",
-                        timeout.as_millis(),
-                        e
-                    )))
-                }),
+            Some(timeout) => util::timeout(timeout, runner).await.unwrap_or_else(|e| {
+                Err(QueryError::RequestTimeout(format!(
+                    "Request took longer than {}ms: {}",
+                    timeout.as_millis(),
+                    e.as_millis()
+                )))
+            }),
             None => runner.await,
         };
 
@@ -1810,7 +1808,7 @@ impl Session {
 
     async fn await_schema_agreement_indefinitely(&self) -> Result<Uuid, QueryError> {
         loop {
-            tokio::time::sleep(self.schema_agreement_interval).await;
+            util::sleep(self.schema_agreement_interval).await;
             if let Some(agreed_version) = self.check_schema_agreement().await? {
                 return Ok(agreed_version);
             }
@@ -1818,7 +1816,7 @@ impl Session {
     }
 
     pub async fn await_schema_agreement(&self) -> Result<Uuid, QueryError> {
-        timeout(
+        util::timeout(
             self.schema_agreement_timeout,
             self.await_schema_agreement_indefinitely(),
         )

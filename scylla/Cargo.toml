@@ -14,11 +14,14 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = []
+default = ["tokio_runtime"]
+futures_ssl = ["dep:futures-rustls"]
 ssl = ["dep:tokio-openssl", "dep:openssl"]
 cloud = ["ssl", "scylla-cql/serde", "dep:serde_yaml", "dep:serde", "dep:url", "dep:base64"]
 secret = ["scylla-cql/secret"]
 chrono = ["scylla-cql/chrono"]
+glommio_runtime = ["glommio"]
+tokio_runtime = ["tokio"]
 time = ["scylla-cql/time"]
 num-bigint-03 = ["scylla-cql/num-bigint-03"]
 num-bigint-04 = ["scylla-cql/num-bigint-04"]
@@ -26,6 +29,8 @@ bigdecimal-04 = ["scylla-cql/bigdecimal-04"]
 full-serialization = ["chrono", "time", "secret", "num-bigint-03", "num-bigint-04", "bigdecimal-04"]
 
 [dependencies]
+async-broadcast = "0.6"
+async-compat = "0.2"
 scylla-macros = { version = "0.4.0", path = "../scylla-macros" }
 scylla-cql = { version = "0.1.0", path = "../scylla-cql" }
 byteorder = "1.3.4"
@@ -33,7 +38,13 @@ bytes = "1.0.1"
 futures = "0.3.6"
 histogram = "0.6.9"
 num_enum = "0.6"
-tokio = { version = "1.27", features = ["net", "time", "io-util", "sync", "rt", "macros"] }
+event-listener = "4"
+flume = "0.11"
+futures-util = "0.3"
+glommio = { version = "0.8", optional = true }
+hickory-resolver = "0.24"
+pin-project-lite = "0.2"
+tokio = { version = "1.27", features = ["net", "time", "io-util", "sync", "rt", "macros"], optional = true }
 snap = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
 rand = "0.8.3"
@@ -41,6 +52,7 @@ thiserror = "1.0"
 itertools = "0.11.0"
 tracing = "0.1.36"
 chrono = { version = "0.4.20", default-features = false, features = ["clock"] }
+futures-rustls = { version = "0.25", optional = true }
 openssl = { version = "0.10.32", optional = true }
 tokio-openssl = { version = "0.6.1", optional = true }
 arc-swap = "1.3.0"

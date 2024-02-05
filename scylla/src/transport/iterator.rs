@@ -9,13 +9,13 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
+use flume::r#async::RecvStream;
 use futures::Stream;
 use scylla_cql::frame::response::NonErrorResponse;
 use scylla_cql::frame::types::SerialConsistency;
 use scylla_cql::types::serialize::row::SerializedValues;
 use std::result::Result;
 use thiserror::Error;
-use tokio::sync::mpsc;
 use tracing::instrument::WithSubscriber;
 
 use super::errors::QueryError;
@@ -36,6 +36,7 @@ use crate::transport::load_balancing::{self, RoutingInfo};
 use crate::transport::metrics::Metrics;
 use crate::transport::retry_policy::{QueryInfo, RetryDecision, RetrySession};
 use crate::transport::{Node, NodeRef};
+use crate::util;
 use tracing::{trace, trace_span, warn, Instrument};
 use uuid::Uuid;
 
@@ -57,10 +58,10 @@ const DEFAULT_ITER_PAGE_SIZE: i32 = 5000;
 
 /// Iterator over rows returned by paged queries\
 /// Allows to easily access rows without worrying about handling multiple pages
-pub struct RowIterator {
+pub struct RowIterator<'a> {
     current_row_idx: usize,
     current_page: Rows,
-    page_receiver: mpsc::Receiver<Result<ReceivedPage, QueryError>>,
+    page_receiver: RecvStream<'a, Result<ReceivedPage, QueryError>>,
     tracing_ids: Vec<Uuid>,
 }
 
@@ -79,14 +80,14 @@ pub(crate) struct PreparedIteratorConfig {
 
 /// Fetching pages is asynchronous so `RowIterator` does not implement the `Iterator` trait.\
 /// Instead it uses the asynchronous `Stream` trait
-impl Stream for RowIterator {
+impl Stream for RowIterator<'_> {
     type Item = Result<Row, QueryError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut s = self.as_mut();
 
         if s.is_current_page_exhausted() {
-            match Pin::new(&mut s.page_receiver).poll_recv(cx) {
+            match Pin::new(&mut s.page_receiver).poll_next(cx) {
                 Poll::Ready(Some(Ok(received_page))) => {
                     s.current_page = received_page.rows;
                     s.current_row_idx = 0;
@@ -115,9 +116,9 @@ impl Stream for RowIterator {
     }
 }
 
-impl RowIterator {
+impl<'a> RowIterator<'a> {
     /// Converts this iterator into an iterator over rows parsed as given type
-    pub fn into_typed<RowT: FromRow>(self) -> TypedRowIterator<RowT> {
+    pub fn into_typed<RowT: FromRow>(self) -> TypedRowIterator<'a, RowT> {
         TypedRowIterator {
             row_iterator: self,
             phantom_data: Default::default(),
@@ -129,11 +130,11 @@ impl RowIterator {
         execution_profile: Arc<ExecutionProfileInner>,
         cluster_data: Arc<ClusterData>,
         metrics: Arc<Metrics>,
-    ) -> Result<RowIterator, QueryError> {
+    ) -> Result<RowIterator<'a>, QueryError> {
         if query.get_page_size().is_none() {
             query.set_page_size(DEFAULT_ITER_PAGE_SIZE);
         }
-        let (sender, receiver) = mpsc::channel(1);
+        let (sender, receiver) = flume::bounded(1);
 
         let consistency = query
             .config
@@ -211,11 +212,11 @@ impl RowIterator {
 
     pub(crate) async fn new_for_prepared_statement(
         mut config: PreparedIteratorConfig,
-    ) -> Result<RowIterator, QueryError> {
+    ) -> Result<RowIterator<'a>, QueryError> {
         if config.prepared.get_page_size().is_none() {
             config.prepared.set_page_size(DEFAULT_ITER_PAGE_SIZE);
         }
-        let (sender, receiver) = mpsc::channel(1);
+        let (sender, receiver) = flume::bounded(1);
 
         let consistency = config
             .prepared
@@ -338,11 +339,11 @@ impl RowIterator {
         connection: Arc<Connection>,
         consistency: Consistency,
         serial_consistency: Option<SerialConsistency>,
-    ) -> Result<RowIterator, QueryError> {
+    ) -> Result<RowIterator<'static>, QueryError> {
         if query.get_page_size().is_none() {
             query.set_page_size(DEFAULT_ITER_PAGE_SIZE);
         }
-        let (sender, receiver) = mpsc::channel::<Result<ReceivedPage, QueryError>>(1);
+        let (sender, receiver) = flume::bounded::<Result<ReceivedPage, QueryError>>(1);
 
         let worker_task = async move {
             let worker = SingleConnectionRowIteratorWorker {
@@ -368,11 +369,11 @@ impl RowIterator {
         connection: Arc<Connection>,
         consistency: Consistency,
         serial_consistency: Option<SerialConsistency>,
-    ) -> Result<RowIterator, QueryError> {
+    ) -> Result<RowIterator<'static>, QueryError> {
         if prepared.get_page_size().is_none() {
             prepared.set_page_size(DEFAULT_ITER_PAGE_SIZE);
         }
-        let (sender, receiver) = mpsc::channel::<Result<ReceivedPage, QueryError>>(1);
+        let (sender, receiver) = flume::bounded::<Result<ReceivedPage, QueryError>>(1);
 
         let worker_task = async move {
             let worker = SingleConnectionRowIteratorWorker {
@@ -395,21 +396,21 @@ impl RowIterator {
 
     async fn new_from_worker_future(
         worker_task: impl Future<Output = PageSendAttemptedProof> + Send + 'static,
-        mut receiver: mpsc::Receiver<Result<ReceivedPage, QueryError>>,
-    ) -> Result<RowIterator, QueryError> {
-        tokio::task::spawn(worker_task.with_current_subscriber());
+        receiver: flume::Receiver<Result<ReceivedPage, QueryError>>,
+    ) -> Result<RowIterator<'static>, QueryError> {
+        util::spawn(worker_task.with_current_subscriber());
 
         // This unwrap is safe because:
         // - The future returned by worker.work sends at least one item
         //   to the channel (the PageSendAttemptedProof helps enforce this)
         // - That future is polled in a tokio::task which isn't going to be
         //   cancelled
-        let pages_received = receiver.recv().await.unwrap()?;
+        let pages_received = receiver.recv_async().await.unwrap()?;
 
         Ok(RowIterator {
             current_row_idx: 0,
             current_page: pages_received.rows,
-            page_receiver: receiver,
+            page_receiver: receiver.into_stream(),
             tracing_ids: if let Some(tracing_id) = pages_received.tracing_id {
                 vec![tracing_id]
             } else {
@@ -438,7 +439,6 @@ impl RowIterator {
 mod checked_channel_sender {
     use scylla_cql::{errors::QueryError, frame::response::result::Rows};
     use std::marker::PhantomData;
-    use tokio::sync::mpsc;
     use uuid::Uuid;
 
     use super::ReceivedPage;
@@ -449,10 +449,10 @@ mod checked_channel_sender {
     pub(crate) struct SendAttemptedProof<T>(PhantomData<T>);
 
     /// An mpsc::Sender which returns proofs that it attempted to send items.
-    pub(crate) struct ProvingSender<T>(mpsc::Sender<T>);
+    pub(crate) struct ProvingSender<T>(flume::Sender<T>);
 
-    impl<T> From<mpsc::Sender<T>> for ProvingSender<T> {
-        fn from(s: mpsc::Sender<T>) -> Self {
+    impl<T> From<flume::Sender<T>> for ProvingSender<T> {
+        fn from(s: flume::Sender<T>) -> Self {
             Self(s)
         }
     }
@@ -461,8 +461,11 @@ mod checked_channel_sender {
         pub(crate) async fn send(
             &self,
             value: T,
-        ) -> (SendAttemptedProof<T>, Result<(), mpsc::error::SendError<T>>) {
-            (SendAttemptedProof(PhantomData), self.0.send(value).await)
+        ) -> (SendAttemptedProof<T>, Result<(), flume::SendError<T>>) {
+            (
+                SendAttemptedProof(PhantomData),
+                self.0.send_async(value).await,
+            )
         }
     }
 
@@ -474,7 +477,7 @@ mod checked_channel_sender {
             tracing_id: Option<Uuid>,
         ) -> (
             SendAttemptedProof<ResultPage>,
-            Result<(), mpsc::error::SendError<ResultPage>>,
+            Result<(), flume::SendError<ResultPage>>,
         ) {
             let empty_page = ReceivedPage {
                 rows: Rows {
@@ -900,12 +903,12 @@ where
 /// Iterator over rows returned by paged queries
 /// where each row is parsed as the given type\
 /// Returned by `RowIterator::into_typed`
-pub struct TypedRowIterator<RowT> {
-    row_iterator: RowIterator,
+pub struct TypedRowIterator<'a, RowT> {
+    row_iterator: RowIterator<'a>,
     phantom_data: std::marker::PhantomData<RowT>,
 }
 
-impl<RowT> TypedRowIterator<RowT> {
+impl<'a, RowT> TypedRowIterator<'a, RowT> {
     /// If tracing was enabled returns tracing ids of all finished page queries
     pub fn get_tracing_ids(&self) -> &[Uuid] {
         self.row_iterator.get_tracing_ids()
@@ -931,7 +934,7 @@ pub enum NextRowError {
 
 /// Fetching pages is asynchronous so `TypedRowIterator` does not implement the `Iterator` trait.\
 /// Instead it uses the asynchronous `Stream` trait
-impl<RowT: FromRow> Stream for TypedRowIterator<RowT> {
+impl<'a, RowT: FromRow> Stream for TypedRowIterator<'a, RowT> {
     type Item = Result<RowT, NextRowError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -954,4 +957,4 @@ impl<RowT: FromRow> Stream for TypedRowIterator<RowT> {
 }
 
 // TypedRowIterator can be moved freely for any RowT so it's Unpin
-impl<RowT> Unpin for TypedRowIterator<RowT> {}
+impl<'a, RowT> Unpin for TypedRowIterator<'a, RowT> {}

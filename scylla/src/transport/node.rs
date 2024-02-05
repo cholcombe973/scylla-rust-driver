@@ -1,4 +1,5 @@
-use tokio::net::lookup_host;
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::Resolver;
 use tracing::warn;
 use uuid::Uuid;
 
@@ -105,7 +106,7 @@ impl Node {
         let rack = peer.rack.clone();
 
         // We aren't interested in the fact that the pool becomes empty, so we immediately drop the receiving part.
-        let (pool_empty_notifier, _) = tokio::sync::broadcast::channel(1);
+        let (pool_empty_notifier, _) = async_broadcast::broadcast(1);
         let pool = enabled.then(|| {
             NodeConnectionPool::new(
                 UntranslatedEndpoint::Peer(peer),
@@ -260,10 +261,16 @@ pub struct ResolvedContactPoint {
 // It prefers to return IPv4s first, and only if there are none, IPv6s.
 pub(crate) async fn resolve_hostname(hostname: &str) -> Result<SocketAddr, io::Error> {
     let mut ret = None;
-    let addrs: Vec<SocketAddr> = match lookup_host(hostname).await {
-        Ok(addrs) => addrs.collect(),
+    let resolver = Resolver::new(ResolverConfig::default(), ResolverOpts::default())?;
+    let addrs: Vec<SocketAddr> = match resolver.lookup_ip(hostname) {
+        Ok(addrs) => addrs.iter().map(|ip| SocketAddr::new(ip, 9042)).collect(),
         // Use a default port in case of error, but propagate the original error on failure
-        Err(e) => lookup_host((hostname, 9042)).await.or(Err(e))?.collect(),
+        Err(e) => resolver
+            .lookup_ip(hostname)
+            .or(Err(e))?
+            .iter()
+            .map(|ip| SocketAddr::new(ip, 9042))
+            .collect(),
     };
     for a in addrs {
         match a {

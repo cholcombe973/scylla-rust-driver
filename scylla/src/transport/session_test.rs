@@ -1,4 +1,4 @@
-use crate as scylla;
+use crate::{self as scylla, util};
 use crate::batch::{Batch, BatchStatement};
 use crate::frame::response::result::Row;
 use crate::prepared_statement::PreparedStatement;
@@ -1098,7 +1098,7 @@ async fn assert_in_tracing_table(session: &Session, tracing_uuid: Uuid) {
         }
 
         // Otherwise retry
-        tokio::time::sleep(std::time::Duration::from_millis(32)).await;
+        util::sleep(std::time::Duration::from_millis(32)).await;
     }
 
     // If all retries failed panic with an error
